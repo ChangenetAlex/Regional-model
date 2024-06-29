@@ -1,0 +1,414 @@
+---
+title: "3.RGBIF Rarefaction"
+author: "A.Changenet"
+date: "10-03-2022->`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_width: 12
+    fig_height: 8
+    fig_caption: no
+  rmdformats::downcute:
+    
+    self_contained: true
+    code_folding: show
+    toc_depth: 2
+    number_sections: true
+    fig_width: 12
+    fig_height: 8
+    collapsed: true
+    df_print: paged
+  word_document:
+    toc_depth: 2
+    number_sections: yes
+    fig_width: 12
+    fig_height: 8
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+
+```{r}
+library("rgbif")
+library(ggmap)
+library(cowplot)
+library(data.table)
+library(dplyr)
+library(CoordinateCleaner)
+library(sf)
+library(sp)
+library(rgeos)
+library(maptools)
+library(proj4)
+library(rgdal)
+library(dplyr)
+library(raster)
+```
+
+
+Load the data of the 4 cities and set the 4 city center. (longitude first then latitude)
+```{r}
+dfM <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/0114847-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfTA <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/0114848-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfG <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/0114849-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfW <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/0150587-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+cG <- c(44.40726,8.9338624)[c(2,1)]
+cM <- c(48.1371079,11.5753822)[c(2,1)]
+cW <- c(48.2083537,16.3725042)[c(2,1)]
+cTA <- c(32.0852997,34.7818064)[c(2,1)]
+
+dfcenter <- list("cG"=cG,"cM"=cM,"cW"=cW,"cTA"=cTA)
+dfcity <- list("dfG"=dfG,"dfM"=dfM,"dfW"=dfW,"dfTA"=dfTA)
+```
+
+Now load the buffer of 50km
+```{r}
+dfG <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/Buffer/0150360-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfM <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/Buffer/0150361-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfW <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/Buffer/0150362-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+dfTA <- fread("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/data/GBIF/Buffer/0150384-210914110416597.csv", header = T, sep = "\t", dec = ".", quote = "", data.table = T)
+
+cG <- c(44.40726,8.9338624)[c(2,1)]
+cM <- c(48.1371079,11.5753822)[c(2,1)]
+cW <- c(48.2083537,16.3725042)[c(2,1)]
+cTA <- c(32.0852997,34.7818064)[c(2,1)]
+
+dfcenter <- list("cG"=cG,"cM"=cM,"cW"=cW,"cTA"=cTA)
+dfcity <- list("dfG"=dfG,"dfM"=dfM,"dfW"=dfW,"dfTA"=dfTA)
+```
+
+In this chunk we define the taxa we want to investigate and the city to be extracted (in a vector for urban area) and in a list to extract according to a buffer. 
+```{r}
+lspecies <- c(
+  "Total",
+  "Animalia",
+  "Plantae",
+  "Mammalia",
+  "Aves",
+  "Insecta",
+  "Amphibia",
+  "Reptilia",
+  "Arachnida"
+)
+names(lspecies) <- lspecies 
+cSp.Curve <- c("Genova","Munich","Wien","TelAViv")
+lSp.Curve <- list("Genova"=NULL,"Munich"=NULL,"Wien"=NULL,"TelAViv"=NULL)
+```
+
+Here define the length of the sequence of number of observations: "n". The max number of observation will be splitted in "n" equal parts and this will be repeated "repet" times. 
+```{r}
+repet <- 10
+n <- 50
+```
+
+
+Now we define the buffers we want to loop over. Be careful. Too many values at once causes problem with the parallel package. So better to use only one core in the case of a lot of buffer. 
+```{r}
+Buffer <- as.list(c(1000,2000)) # for testng purpose
+Buffer <- as.list(c(1000,2000,3000,seq(5000,50000,5000)))
+```
+
+Here function to obtain rarefaction curve within the cities boundaries !: Nbr species observed for X random observations. Do we reach a plateau?
+```{r}
+setwd("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/Script/Regional_model")
+
+Sp.Curve <- mapply(function(x,y){
+  df <- x
+    Tot_A <- lapply(lspecies, function(s){
+      Tot_A <- subset(df,select=c("species","kingdom","class"))
+        if (s%in%c("Total")){
+          Tot_A <- subset(Tot_A,select="species")
+        } else if (s%in%c("Animalia","Plantae")){
+          Tot_A <- subset(Tot_A,kingdom == s,select="species")
+        } else {
+          Tot_A <- subset(Tot_A,class == s,select="species")
+        }
+      SIZE <- as.list(round(seq(1,nrow(Tot_A),length.out=n),0))
+      Sample.l = lapply(SIZE,function(x){
+        Species.vec <- rep(NA, repet)
+        for (i in 1:repet){
+          Sample.df <- sample(1:nrow(Tot_A),x)
+          Sample.df <- Tot_A[Sample.df,]
+          Species.vec[i] <- Sample.df %>% unique %>% nrow %>% as.numeric
+        }
+        Species_df <- data.frame("sp"=mean(Species.vec),
+                                 "sp.var"=var(Species.vec),
+                                 "obs"=as.numeric(x),
+                                 "Taxa"=s,
+                                 "city"=y,
+                                 "Distance"=NA)
+      ;Species_df})
+      Sample.l <- as.data.frame(do.call(rbind,Sample.l))
+        ;Sample.l})
+    Species_accum <- as.data.frame(do.call(rbind,Tot_A))
+    ;Species_accum},x=dfcity,y=cSp.Curve, SIMPLIFY = FALSE)
+dfSp.Curve <- as.data.frame(do.call(rbind,Sp.Curve))
+dfSp.Curve$sp <- as.numeric(dfSp.Curve$sp)
+saveRDS(dfSp.Curve,file = "Species_Curve_Data_RAREFACTION_cities.rds")
+```
+
+
+Here function to obtain rarefaction curve within the cities boundaries !: Nbr species observed for X random observations. Do we reach a plateau?
+```{r}
+setwd("~/Library/CloudStorage/OneDrive-u-bordeaux.fr/Postdoc_Italy/Script/Regional_model")
+
+for (i in 1:length(dfcity)){
+  df <- dfcity[[i]]
+  Center <- dfcenter[[i]]
+  SP_DF = st_as_sf(df,coords=c("decimalLongitude","decimalLatitude"),
+                   crs = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ")
+  City_center <- st_sfc(st_point(Center), crs = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ")
+  Sp.Curve <- parallel::mclapply(Buffer, function(x) {
+    circle <- st_buffer(City_center, x) 
+    SP_DF_col <- st_cast(SP_DF, "POINT")
+    INTER_point <- st_intersects(circle, SP_DF_col)[[1]]
+    SP_DF_col_intersect <- SP_DF_col[INTER_point,]
+    Tot_A <- lapply(lspecies, function(s){
+      Tot_A <- subset(SP_DF_col_intersect,select=c("species","kingdom","class")) %>%
+        st_drop_geometry
+        if (s%in%c("Total")){
+          Tot_A <- subset(Tot_A,select="species")
+        } else if (s%in%c("Animalia","Plantae")){
+          Tot_A <- subset(Tot_A,kingdom == s,select="species")
+        } else {
+          Tot_A <- subset(Tot_A,class == s,select="species")
+        }
+      SIZE <- as.list(round(seq(1,nrow(Tot_A),length.out=n),0))
+      Sample.l = lapply(SIZE,function(z){
+        Species.vec <- rep(NA, repet)
+        for (i in 1:repet){
+          Sample.df <- sample(1:nrow(Tot_A),z)
+          Sample.df <- Tot_A[Sample.df,]
+          Species.vec[i] <- Sample.df %>% unique %>% nrow %>% as.numeric
+        }
+        Species_df <- data.frame("sp"=mean(Species.vec),
+                                 "sp.var"=var(Species.vec),
+                                 "obs"=as.numeric(z),
+                                 "Taxa"=s,
+                                 "Distance"=x)
+      ;Species_df})
+      Sample.l <- as.data.frame(do.call(rbind,Sample.l))
+        ;Sample.l})
+    Species_accum <- as.data.frame(do.call(rbind,Tot_A))
+    
+        ;Species_accum}
+    ,mc.cores = 3)
+  Sp.Curve <- as.data.frame(do.call(rbind,Sp.Curve))
+  Sp.Curve$city <- names(lSp.Curve)[i]
+  lSp.Curve[[i]] <- Sp.Curve
+}
+dfSp.Curve <- as.data.frame(do.call(rbind,lSp.Curve))
+saveRDS(dfSp.Curve,file = "Species_Curve_Data_RAREFACTION_1000_50000.rds")
+```
+
+
+Here load the Yearly data and the city data
+```{r}
+list.files()
+Myrds <- as.list(grep(paste0("RAREFACTION"),list.files(),value = T))
+Myrds <- as.list(grep(paste0("rds"),Myrds,value = T))
+rds_ALL <- lapply(Myrds,function(x) readRDS(x))
+dfSp.Curve <- rds_ALL[[1]]
+dfcity <- rds_ALL[[2]]
+dfcity <- dfcity[,c(1:4,6,5)]
+dfcity$Distance <- "City limits"
+df_all <- rbind(dfcity,dfSp.Curve)
+
+df_all$Dist_Taxa <- paste0(df_all$Taxa,", d = ",df_all$Distance)
+A <- expand.grid(unique(df_all$Distance),unique(df_all$Taxa))
+A <- paste0(A[,2],", d = ",A[,1])
+
+df_all$Dist_Taxa <- factor(df_all$Dist_Taxa,levels=A)
+df_all$Dist_Taxa
+
+```
+
+Here plot the results as species accumulation plot. 
+First: One facet with all information
+```{r}
+p1<-ggplot(df_all,
+           aes(x=obs,
+               y=sp,
+               color=as.factor(city),
+               group=as.factor(city)))+
+  geom_line(size=1)+
+  geom_point(size=1,stroke=1)+
+  #facet_wrap(city ~ Distance,scales = "free")+
+  facet_grid(Taxa ~ Distance,scales = "free",margins = F)+
+  # geom_hline(data=dfcity,
+  #            aes(yintercept=get(Resp[N]),
+  #                color=as.factor(Taxa),
+  #                group=as.factor(Taxa),
+  #              linetype="Administrative boundaries"), 
+  #            size=0.5) +
+  # scale_linetype_manual(name = "Administrative boundaries",
+  #                       values = c("dashed"))+
+  labs(y="Species observed",
+       x="Number of observations")+
+  theme_light(base_size = 15)+
+  theme(text = element_text(face="bold"),
+        #legend.position = c(.65, .99),
+        legend.position = c("bottom"),
+        #legend.justification = c("left", "top"),
+        legend.justification = c("center"),
+        legend.direction ="horizontal",
+        axis.text.x = element_text(size=13,color="black",angle = 60,vjust = 0.5),
+        axis.text.y = element_text(size=13,color="black"),
+        legend.text=element_text(size=12),
+        legend.key.size = unit(1.5,"line"),
+        legend.key.width = unit(2,"line"),
+        legend.margin = margin(1,1,1,1),
+        legend.box.margin = margin(1,1,1,1),
+        legend.title = element_blank(),
+        legend.background=element_rect(fill="white",
+                                       colour="black",
+                                       size=0.2),
+        panel.border = element_rect(colour = "black",
+                                    fill=NA,
+                                    size=0.8),
+        axis.line = element_line(colour="black"),
+        plot.title = element_text(size=18,hjust = 0.5),
+        plot.caption = element_text(face="bold.italic"))
+print(p1)
+save_plot(filename = paste0("Species_Curve_Accum_RAREFACTION_1000_50000_AllTaxa.pdf"),
+          plot = p1,
+          base_width = 15,
+          base_height = 12,
+          dpi = 1000,
+          units = "in",1)
+#saveRDS(p1,file = "Species_Curve_Accum_1000_50000.rds")
+```
+
+Second: One curve by city with taxa and buffer as facet
+```{r}
+for (i in unique(df_all$city)){
+df_all_subset <- df_all[df_all$city==i,]
+p1<-ggplot(df_all_subset,
+           aes(x=obs,
+               y=sp,
+               color=as.factor(Taxa)))+
+  geom_line(size=0.5)+
+  geom_point(size=1.5,stroke=0.5,shape=16)+
+  #facet_grid(Taxa ~ Distance,scales = "free")+
+  facet_wrap(vars(Dist_Taxa),nrow=length(unique(df_all$Taxa)),
+           ncol=length(unique(df_all$Distance)),scales = "free")+
+  ggtitle(paste0("Species accumulation curve in the city of ",i,
+                 "\nBy Taxa (columns) and by buffer size (rows)"))+
+  labs(y="Number of species observed",
+       x="Number of observations")+
+  theme_light(base_size = 15)+
+  theme(text = element_text(face="bold"),
+        strip.text = element_text(size = 12, colour = "white", margin = margin(0.2,0.2,0.2,0.2, "cm")),
+        #legend.position = c(.65, .99),
+        legend.position = c("bottom"),
+        #legend.justification = c("left", "top"),
+        legend.justification = c("center"),
+        legend.direction ="horizontal",
+        axis.text.x = element_text(size=13,color="black",angle = 60,vjust = 0.5),
+        axis.text.y = element_text(size=13,color="black"),
+        legend.text=element_text(size=12),
+        legend.key.size = unit(1.5,"line"),
+        legend.key.width = unit(2,"line"),
+        legend.margin = margin(1,1,1,1),
+        legend.box.margin = margin(1,1,1,1),
+        legend.title = element_blank(),
+        legend.background=element_rect(fill="white",
+                                       colour="black",
+                                       size=0.2),
+        panel.border = element_rect(colour = "black",
+                                    fill=NA,
+                                    size=0.8),
+        axis.line = element_line(colour="black"),
+        plot.title = element_text(size=18,hjust = 0.5),
+        plot.caption = element_text(face="bold.italic"))
+#print(p1)
+save_plot(filename = paste0("Species_Curve_Accum_RAREFACTION_1000_50000_AllTaxa_",i,"_2000.pdf"),
+          plot = p1,
+          base_width = 35,
+          base_height = 28,
+          dpi = 2000,
+          units = "in",1)
+}
+```
+
+
+Figure regional model 
+```{r}
+unique(df_all$city)
+df_all_subset <- df_all[df_all$city==i,]
+
+unique(df_all$Distance)
+df_all_subset <- df_all[df_all$Distance=="50000",]
+
+dput(unique(df_all$Taxa))
+df_all_subset <- df_all_subset[df_all_subset$Taxa%in%c("Plantae", "Mammalia", "Aves", "Insecta"),]
+
+df_all_subset$City_Taxa <- paste0(df_all_subset$Taxa," (",df_all_subset$city,")") 
+
+p1<-ggplot(df_all_subset,
+           aes(x=obs,
+               y=sp,
+               color=as.factor(Taxa),
+               shape=as.factor(city)))+
+  geom_line(size=0.5)+
+  geom_point(size=1.5,stroke=0.5)+
+  #facet_grid(Taxa ~ Distance,scales = "free")+
+  facet_wrap(vars(City_Taxa),nrow=length(unique(df_all_subset$Taxa)),
+           ncol=length(unique(df_all_subset$city)),scales = "free")+
+  ggtitle(paste0("Species accumulation curve in a radius of 50km around \n4 different cities (columns) and across several taxa (rows)"))+
+  labs(y="Number of species observed",
+       x="Number of observations")+
+  theme_light(base_size = 15)+
+  theme(text = element_text(face="bold"),
+        strip.text = element_text(size = 12, colour = "white", margin = margin(0.2,0.2,0.2,0.2, "cm")),
+        #legend.position = c(.65, .99),
+        legend.position = c("bottom"),
+        #legend.justification = c("left", "top"),
+        legend.justification = c("center"),
+        legend.direction ="horizontal",
+        axis.text.x = element_text(size=13,color="black",angle = 60,vjust = 0.5),
+        axis.text.y = element_text(size=13,color="black"),
+        legend.text=element_text(size=12),
+        legend.key.size = unit(1.5,"line"),
+        legend.key.width = unit(2,"line"),
+        legend.margin = margin(1,1,1,1),
+        legend.box.margin = margin(1,1,1,1),
+        legend.title = element_blank(),
+        legend.background=element_rect(fill="white",
+                                       colour="black",
+                                       size=0.2),
+        panel.border = element_rect(colour = "black",
+                                    fill=NA,
+                                    size=0.8),
+        axis.line = element_line(colour="black"),
+        plot.title = element_text(size=18,hjust = 0.5),
+        plot.caption = element_text(face="bold.italic"))
+print(p1)
+save_plot(filename = paste0("Species_Curve_Accum_RAREFACTION_50000_4_Taxa2.png"),
+          plot = p1,
+          base_width = 12,
+          base_height = 12,
+          dpi = 1500,
+          units = "in",1)
+
+```
+
+
+
+
+
+

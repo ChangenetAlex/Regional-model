@@ -1,0 +1,147 @@
+---
+title: "RegionalModel"
+author: "AlexC"
+format: html
+editor: visual
+---
+```{r}
+#title: "RGBIF request to extract species occurrences for plant and animal in 50 km buffer
+#around ECOLOPES's centroid coordinates" and to clean obtained data for usage in Ecolopes model
+#Authors: Alex Changenet; Mariasole Calbi
+#output: csv file
+
+library(rgbif)
+library(dplyr)
+library(CoordinateCleaner)
+library(sf)
+library(taxonlookup)
+library(U.Taxonstand)
+library(stringr)
+
+cECOLOPES <- c(44.40726,8.9338624)[c(2,1)] #example coordinate of site centroid
+
+Animal <- 1
+Plante <- 6
+
+dfcenter <- list("ECOLOPES1"= cECOLOPES) #it is possible to add more centroids too here
+Buffer <- 50000 #buffer radius set to 50 km can be changed
+
+My_Pol<- lapply(dfcenter,function(x){
+  City_center <- st_sfc(st_point(x), crs = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ")
+  circle <- st_buffer(City_center, Buffer)
+  My_Polygon <- st_as_text(circle)
+  ;My_Polygon})
+
+gbif_taxon_keys <- c(1,6)
+user="" # GBIF user name
+pwd="" # GBIF password
+email="" # your email
+
+gbifdw<-lapply(My_Pol[[1]],function(x){
+  gbif_download <- occ_download(
+    type="and",
+    pred_in("taxonKey", gbif_taxon_keys),
+    pred("hasGeospatialIssue", FALSE),
+    pred("hasCoordinate", TRUE),
+    pred_within(x),
+    format = "SIMPLE_CSV",
+    user=user,pwd=pwd,email=email
+  )
+})
+
+occ_download_wait(gbifdw) #this let you know at which stage is your request
+
+#pipeline for further data filtering
+gbifdw_filt <-gbifdw %>%
+  occ_download_get() %>%
+  occ_download_import() %>%
+  setNames(tolower(names(.))) %>% # set lowercase column names to work with CoordinateCleaner
+  filter(occurrencestatus  == "PRESENT") %>%
+  filter(!basisofrecord %in% c("FOSSIL_SPECIMEN")) %>%
+  filter(year >= 1900) %>%
+  filter(coordinateprecision < 0.01 | is.na(coordinateprecision)) %>%
+  filter(coordinateuncertaintyinmeters < 10000 | is.na(coordinateuncertaintyinmeters)) %>%
+  filter(!coordinateuncertaintyinmeters %in% c(301,3036,999,9999)) %>%  #remove records with known default values for coordinateUncertaintyInMeters
+  filter(!decimallatitude == 0 | !decimallongitude == 0) %>% #remove point plotted along the prime meridian or equator
+  cc_sea() %>% # remove from ocean
+  distinct(decimallongitude,decimallatitude,specieskey,datasetkey, .keep_all = TRUE) %>%
+  glimpse() # look at results of pipeline
+
+#cancel data if needed
+#occ_download_cancel(user=user,pwd=pwd,
+#                    key="")
+
+#once GBIF data is loaded we need to match it to PFGs and AFGs loading PFGs/AFGs classifications
+plants<-gbifdw_filt[gbifdw_filt$kingdom == "Plantae",]
+animals<-gbifdw_filt[gbifdw_filt$kingdom == "Animalia",]
+
+#first a name matching to TPL plant nomenclature that was used in PFGs
+#check nomenclature according to TPL
+# load the database
+library(openxlsx)
+dat1 <- read.xlsx("Plants_TPL_database_part1.xlsx")
+dat2 <- read.xlsx("Plants_TPL_database_part2.xlsx")
+dat3 <- read.xlsx("Plants_TPL_database_part3.xlsx")
+database <- rbind(dat1, dat2, dat3)
+rm(dat1, dat2, dat3)
+
+#first taxonomy cleanup by JENS
+tracheophytes <- plant_lookup(include_counts=T)
+# seperate genus from species binomial
+genera <- word(unique(plants$species),1)
+genera <- data.frame(genus=genera, species=unique(plants$species))
+# join with data species data
+genera <- left_join(genera, tracheophytes[,c(3,6)])
+# exclude bryophytes
+genera <- with(genera, genera[group!="Bryophytes",])
+genera<-genera[complete.cases(genera),]
+#match data to the remaining species
+plants<-plants[plants$species %in% genera$species,]
+
+specnos <- plants%>%
+  group_by(species)%>%
+  dplyr::summarise(count = n())
+
+# run the main function of name matching
+res <- nameMatch(spList=specnos$species, spSource=database, author=FALSE, max.distance=1, Append=FALSE)
+
+#extract species with no Fuzzy matching
+res2<-res[res$Fuzzy == FALSE,]
+res_FUZZY<-res[res$Fuzzy == TRUE,]
+res3<-res_FUZZY[!is.na(res_FUZZY$Accepted_SPNAME),]#keep good ones with fuzzy match anyway
+res_ok<-rbind(res2,res3)
+
+#extract only spp with no fuzzy match from trait df
+plants_TPL<-plants[plants$species %in% res_ok$Submitted_Name,]
+#add new taxonomic name to trait df
+res_red<-res_ok[,c(2,8,10,19,21)]
+colnames(res_red)<-c("AccSpeciesName","Genus_TPL","ID_TPL","Family_TPL","TPL_spname")
+
+unique<-unique(plants$species)
+spp_idx<-match(unique, res_red$AccSpeciesName)
+res_red_ord<-res_red[spp_idx,]
+
+#insert back new species Id according to original unique identifiers,also add genus and family column
+plants_TPL<-plants_TPL %>%
+  mutate(
+    TPL_SP = factor(species, levels = unique(species), labels = res_red_ord$TPL_spname),
+  )
+plants_TPL$tip <- sub(" ", "_", plants_TPL$TPL_SP)
+
+#read PFGs species and traits list
+PFGS_sp_tr<-read.csv("PFGs_species_traits.csv", header = T, row.names = 1, check.names = F)
+#retrieve species belonging to PFGs around selected locations
+PFGS_spp_ecolopes<-PFGS_sp_tr[PFGS_sp_tr$tip %in% plants_TPL$tip,]
+
+PFGs_list<-PFGS_spp_ecolopes$PFG #this list is the input PFGs list for the model
+
+#same should be done with animals
+AFGs_spp<-read.csv("...")
+#taxonomic match?
+#retrieve AFGs list
+AFGs_spp_ecolopes<-animals[animals$species %in% AFG_spp$sp,]
+AFGs_list<-AFGS_spp_ecolopes$AFG#list of AFGS around chosen location, to be inputted to the model too.
+
+
+```
+
