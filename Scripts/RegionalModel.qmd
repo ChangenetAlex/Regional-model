@@ -1,15 +1,15 @@
 ---
-title: "RegionalModel"
-author: "AlexC"
+title: "RGBIF request to extract species occurrences for plant and animal in 50 km buffer"
+author: "Alex Changenet and Mariasole Calbi"
 format: html
 editor: visual
 ---
-```{r}
-#title: "RGBIF request to extract species occurrences for plant and animal in 50 km buffer
-#around ECOLOPES's centroid coordinates" and to clean obtained data for usage in Ecolopes model
-#Authors: Alex Changenet; Mariasole Calbi
-#output: csv file
 
+This script extracts species occurrences and clean data for usage in the ECOLOPES model
+The output are as csv files
+
+```{r}
+# Load Required Libraries
 library(rgbif)
 library(dplyr)
 library(CoordinateCleaner)
@@ -17,41 +17,42 @@ library(sf)
 library(taxonlookup)
 library(U.Taxonstand)
 library(stringr)
+library(openxlsx)
 
-cECOLOPES <- c(44.40726,8.9338624)[c(2,1)] #example coordinate of site centroid
+# Define Centroid Coordinates and Buffer
+site_centroid_coords <- c(44.40726,8.9338624)[c(2,1)] #Example centroid coordinates for ECOLOPES site
+dfcenter <- list("ECOLOPES1"= site_centroid_coords) #it is possible to add more centroids too here
+buffer_radius <- 50000 #50 km buffer around the centroid; adjustable if needed
 
-Animal <- 1
-Plante <- 6
 
-dfcenter <- list("ECOLOPES1"= cECOLOPES) #it is possible to add more centroids too here
-Buffer <- 50000 #buffer radius set to 50 km can be changed
+# Set GBIF user credentials
+user <- ""  # GBIF user name
+pwd <- ""   # GBIF password
+email <- "" # GBIF email
+gbif_taxon_keys <- c(1,6)  # Taxon keys for animals and plants in GBIF
 
-My_Pol<- lapply(dfcenter,function(x){
-  City_center <- st_sfc(st_point(x), crs = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ")
-  circle <- st_buffer(City_center, Buffer)
-  My_Polygon <- st_as_text(circle)
-  ;My_Polygon})
+# Function to Generate Buffer Polygons for Defined Centroids
+buffer_polygons<- lapply(dfcenter,function(coords){
+  city_center <- st_sfc(st_point(coords), crs = "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ")
+  buffer <- st_buffer(city_center, buffer_radius)
+  st_as_text(buffer)
+})
 
-gbif_taxon_keys <- c(1,6)
-user="" # GBIF user name
-pwd="" # GBIF password
-email="" # your email
-
-gbifdw<-lapply(My_Pol[[1]],function(x){
+# GBIF Data Extraction: Download Species Occurrences Within Buffer
+gbifdw<-lapply(buffer_polygons[[1]],function(buffer){
   gbif_download <- occ_download(
     type="and",
     pred_in("taxonKey", gbif_taxon_keys),
     pred("hasGeospatialIssue", FALSE),
     pred("hasCoordinate", TRUE),
-    pred_within(x),
+    pred_within(buffer),
     format = "SIMPLE_CSV",
     user=user,pwd=pwd,email=email
   )
 })
+occ_download_wait(gbifdw) # Monitor GBIF request status
 
-occ_download_wait(gbifdw) #this let you know at which stage is your request
-
-#pipeline for further data filtering
+# Data Cleaning Pipeline
 gbifdw_filt <-gbifdw %>%
   occ_download_get() %>%
   occ_download_import() %>%
@@ -71,22 +72,23 @@ gbifdw_filt <-gbifdw %>%
 #occ_download_cancel(user=user,pwd=pwd,
 #                    key="")
 
-#once GBIF data is loaded we need to match it to PFGs and AFGs loading PFGs/AFGs classifications
-plants<-gbifdw_filt[gbifdw_filt$kingdom == "Plantae",]
-animals<-gbifdw_filt[gbifdw_filt$kingdom == "Animalia",]
+# Separate Plant and Animal Data
+plants <- gbifdw_filt[gbifdw_filt$kingdom == "Plantae",]
+animals <- gbifdw_filt[gbifdw_filt$kingdom == "Animalia",]
 
-#first a name matching to TPL plant nomenclature that was used in PFGs
-#check nomenclature according to TPL
-# load the database
-library(openxlsx)
+# Load TPL Database and Prepare Plant Data for Name Matching
+# This part is designed to standardize plant taxonomy using The Plant List (TPL) database
+
+# Load TPL Databases and Combine
 dat1 <- read.xlsx("Plants_TPL_database_part1.xlsx")
 dat2 <- read.xlsx("Plants_TPL_database_part2.xlsx")
 dat3 <- read.xlsx("Plants_TPL_database_part3.xlsx")
-database <- rbind(dat1, dat2, dat3)
+tpl_database <- rbind(dat1, dat2, dat3)
 rm(dat1, dat2, dat3)
 
+# Run Plant Taxonomy Lookup and Match to ECOLOPES
 #first taxonomy cleanup by JENS
-tracheophytes <- plant_lookup(include_counts=T)
+tracheophytes <- plant_lookup(include_counts=TRUE)
 # seperate genus from species binomial
 genera <- word(unique(plants$species),1)
 genera <- data.frame(genus=genera, species=unique(plants$species))
@@ -95,53 +97,52 @@ genera <- left_join(genera, tracheophytes[,c(3,6)])
 # exclude bryophytes
 genera <- with(genera, genera[group!="Bryophytes",])
 genera<-genera[complete.cases(genera),]
-#match data to the remaining species
-plants<-plants[plants$species %in% genera$species,]
 
-specnos <- plants%>%
-  group_by(species)%>%
+#match data to the remaining species
+plants <- plants %>% filter(species %in% genera$species)
+
+# Match Names to TPL Database
+specnos <- plants %>%
+  group_by(species) %>%
   dplyr::summarise(count = n())
 
 # run the main function of name matching
-res <- nameMatch(spList=specnos$species, spSource=database, author=FALSE, max.distance=1, Append=FALSE)
+name_match_results <- nameMatch(spList = specnos$species, spSource = tpl_database, author = FALSE, max.distance = 1, Append = FALSE)
+
+# Separate Results with and without Fuzzy Matching
+matched_species <- name_match_results %>%
+  filter(Fuzzy == FALSE | (!is.na(Accepted_SPNAME) & Fuzzy == TRUE))
 
 #extract species with no Fuzzy matching
-res2<-res[res$Fuzzy == FALSE,]
-res_FUZZY<-res[res$Fuzzy == TRUE,]
-res3<-res_FUZZY[!is.na(res_FUZZY$Accepted_SPNAME),]#keep good ones with fuzzy match anyway
-res_ok<-rbind(res2,res3)
+name_match_results2<-name_match_results[name_match_results$Fuzzy == FALSE,]
+name_match_results_FUZZY<-name_match_results[name_match_results$Fuzzy == TRUE,]
+name_match_results3<-name_match_results_FUZZY[!is.na(name_match_results_FUZZY$Accepted_SPNAME),]#keep good ones with fuzzy match anyway
+matched_species <- rbind(name_match_results2,name_match_results3)
 
-#extract only spp with no fuzzy match from trait df
-plants_TPL<-plants[plants$species %in% res_ok$Submitted_Name,]
+# Finalize plant data with TPL matches
+plants_tpl <- plants %>% filter(species %in% matched_species$Submitted_Name)
 #add new taxonomic name to trait df
-res_red<-res_ok[,c(2,8,10,19,21)]
-colnames(res_red)<-c("AccSpeciesName","Genus_TPL","ID_TPL","Family_TPL","TPL_spname")
+res_final <- matched_species[,c(2,8,10,19,21)]
+colnames(res_final)<-c("AccSpeciesName","Genus_TPL","ID_TPL","Family_TPL","TPL_spname")
 
 unique<-unique(plants$species)
-spp_idx<-match(unique, res_red$AccSpeciesName)
-res_red_ord<-res_red[spp_idx,]
+spp_idx<-match(unique, res_final$AccSpeciesName)
+res_final_ord <- res_final[spp_idx,]
 
 #insert back new species Id according to original unique identifiers,also add genus and family column
-plants_TPL<-plants_TPL %>%
+plants_tpl <- plants_tpl %>%
   mutate(
-    TPL_SP = factor(species, levels = unique(species), labels = res_red_ord$TPL_spname),
+    TPL_SP = factor(species, levels = unique(species), labels = res_final_ord$TPL_spname),
+    tip = sub(" ", "_", TPL_SP)
   )
-plants_TPL$tip <- sub(" ", "_", plants_TPL$TPL_SP)
 
-#read PFGs species and traits list
-PFGS_sp_tr<-read.csv("PFGs_species_traits.csv", header = T, row.names = 1, check.names = F)
-#retrieve species belonging to PFGs around selected locations
-PFGS_spp_ecolopes<-PFGS_sp_tr[PFGS_sp_tr$tip %in% plants_TPL$tip,]
+# Load and Filter for PFGs Trait Database (Plant Functional Groups)
+pfgs_traits<-read.csv("PFGs_species_traits.csv", header = T, row.names = 1, check.names = F)
+pfgs_spp_ecolopes <- pfgs_traits %>% filter(tip %in% plants_tpl$tip)
+pfgs_list<-pfgs_spp_ecolopes$PFG # List of PFGs around the selected location for model input
 
-PFGs_list<-PFGS_spp_ecolopes$PFG #this list is the input PFGs list for the model
-
-#same should be done with animals
-AFGs_spp<-read.csv("...")
-#taxonomic match?
-#retrieve AFGs list
-AFGs_spp_ecolopes<-animals[animals$species %in% AFG_spp$sp,]
-AFGs_list<-AFGS_spp_ecolopes$AFG#list of AFGS around chosen location, to be inputted to the model too.
-
-
+# Process Animal Data and Retrieve Animal Functional Groups (AFGs)
+afgs_spp<-read.csv("...")  # Placeholder path for AFG data
+afgs_spp_ecolopes<-animals[animals$species %in% afg_spp$sp,]
+afgs_list<-afgs_spp_ecolopes$AFG # List of AFGs around the selected location for model input
 ```
-
